@@ -145,15 +145,17 @@ def generate():
 
 
 if __name__ == "__main__":
+    import torch
+    torch.cuda.set_device('cuda:5')
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8602)
     parser.add_argument("--preload", action="store_true", default=True)
     parser.add_argument("--no-preload", dest="preload", action="store_false")
     args = parser.parse_args()
 
     if args.preload:
         # Load models at startup rather than on the first request.
-        bk.get_models(cpu_offloading=True)
+        bk.get_models(cpu_offloading=False)
 
     app.run(host=args.host, port=args.port, threaded=False)

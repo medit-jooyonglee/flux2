@@ -264,7 +264,11 @@ def main_test(
 
 
 if __name__ == "__main__":
+    import torch
+    torch.cuda.set_device('cuda:5')
     # from fire import Fire
 
     # Fire({"main": main, "main_test": main_test})
-    main_test()
+    main_test(
+        cpu_offloading=False
+    )

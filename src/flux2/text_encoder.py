@@ -30,6 +30,18 @@ NSFW_THRESHOLD = 0.85
 UPSAMPLING_MAX_IMAGE_SIZE = 768**2
 
 
+def _fp8_supported(device: str | torch.device) -> bool:
+    """FP8 checkpoints load via Triton kernels that lower the e4m3 dtype to native
+    hardware ops, which Triton only supports on Ada/Hopper (compute capability >= 8.9).
+    On older GPUs (e.g. Ampere, cc 8.6) the Triton kernel fails to compile, so fall back
+    to the non-quantized checkpoint there.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    return major > 8 or (major == 8 and minor >= 9)
+
+
 class Mistral3SmallEmbedder(nn.Module):
     def __init__(
         self,
@@ -433,4 +445,5 @@ def load_mistral_small_embedder(device: str | torch.device = "cuda") -> Mistral3
 
 
 def load_qwen3_embedder(variant: str, device: str | torch.device = "cuda"):
-    return Qwen3Embedder(model_spec=f"Qwen/Qwen3-{variant}-FP8", device=device)
+    suffix = "-FP8" if _fp8_supported(device) else ""
+    return Qwen3Embedder(model_spec=f"Qwen/Qwen3-{variant}{suffix}", device=device)
