@@ -18,9 +18,13 @@ Endpoint: POST /generate
     X-Image-Urls         comma-separated URLs the server should download as reference
                           image(s) for editing/multi-reference generation, optional
 
-  Body (optional):
-    Raw image bytes -> used as a (single) reference image, combined with any images
-    from X-Image-Urls (body image comes first). Omit both for plain text-to-image.
+  Body (optional, pick one):
+    - multipart/form-data with one or more "images" file parts -> multiple reference
+      images, in upload order (use this for several local files at once)
+    - raw image bytes (Content-Type: application/octet-stream) -> a single reference
+      image
+    Either is combined with any images fetched from X-Image-Urls (those come last).
+    Omit all three for plain text-to-image.
 
   Response: image/png bytes. Header X-Elapsed-Ms carries the generation time.
 
@@ -38,6 +42,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import traceback
 from pathlib import Path
 
@@ -62,6 +67,14 @@ def _download_image(url: str) -> Image.Image:
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
+
+
+_FATAL_CUDA_MARKERS = ("out of memory", "cuda error", "device-side assert")
+
+
+def _is_fatal_cuda_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(marker in msg for marker in _FATAL_CUDA_MARKERS)
 
 
 @app.route("/health", methods=["GET"])
@@ -92,7 +105,14 @@ def generate():
 
     images: list[Image.Image] = []
 
-    if request.data:
+    upload_files = request.files.getlist("images") if request.files else []
+    if upload_files:
+        for f in upload_files:
+            try:
+                images.append(Image.open(f.stream).convert("RGB"))
+            except Exception as e:
+                return Response(f"Invalid image upload ({f.filename}): {e}", status=400)
+    elif request.data:
         try:
             images.append(Image.open(io.BytesIO(request.data)).convert("RGB"))
         except Exception as e:
@@ -131,7 +151,23 @@ def generate():
         )
     except Exception as e:
         traceback.print_exc()
-        torch.cuda.empty_cache()
+        fatal = _is_fatal_cuda_error(e)
+
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            # If this itself throws, the CUDA context is definitely poisoned.
+            fatal = True
+
+        if fatal:
+            print(
+                "FATAL: CUDA context is likely corrupted after this error. "
+                "Exiting so the process can be restarted (see scripts/run_server_forever.ps1).",
+                file=sys.stderr,
+            )
+            # Give Flask a moment to flush this response before killing the process.
+            threading.Timer(1.0, lambda: os._exit(1)).start()
+
         return Response(f"Generation failed: {e}", status=500)
     finally:
         if tmp_dir:

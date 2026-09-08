@@ -130,9 +130,10 @@ def infer(
             torch.cuda.empty_cache()
             model.to(DEVICE)
 
+        gen_device = next(model.parameters()).device
         shape = (1, 128, height // 16, width // 16)
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        randn = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device="cuda")
+        generator = torch.Generator(device=gen_device).manual_seed(seed)
+        randn = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device=gen_device)
         x, x_ids = batched_prc_img(randn)
         timesteps = get_schedule(num_steps, x.shape[1])
 
@@ -164,7 +165,7 @@ def infer(
 
 def main(
     # prompt: str = "a photo of a forest with mist swirling around the tree trunks",
-    prompt: str = "a pretty woman scarllet yohanson",
+    prompt: str = "a pretty girl",
     width: int = 1024,
     height: int = 1024,
     match_image_size: int | None = None,
@@ -223,7 +224,7 @@ def main(
 
 
 def main_test(
-    prompts: str='a pretty woman scarllet yohanson | some teeth image',
+    prompts: str='a pretty  girl',
     width: int = 1024,
     height: int = 1024,
     match_image_size: int | None = None,
