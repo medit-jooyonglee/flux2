@@ -119,8 +119,12 @@ def infer(
     width, height = _resolve_size(width, height, img_ctx, match_image_size)
 
     with torch.no_grad():
-        # Invariant on entry (holds after get_models() and after every prior infer() call):
-        # text_encoder is on GPU, model is on CPU.
+        # text_encoder is always on GPU on entry (every exit path below restores it there,
+        # or never moved it in the first place). model's device, however, depends on
+        # whichever cpu_offloading value the *previous* infer() call (or get_models(), for
+        # the first call) used -- since get_models() is a singleton, a call with
+        # cpu_offloading=False can't assume model is already on GPU just because this call
+        # didn't ask for offloading. So model.to(DEVICE) below must be unconditional.
         ref_tokens, ref_ids = encode_image_refs(ae, img_ctx)
         ctx = text_encoder([prompt]).to(torch.bfloat16)
         ctx, ctx_ids = batched_prc_txt(ctx)
@@ -128,7 +132,7 @@ def infer(
         if cpu_offloading:
             text_encoder.cpu()
             torch.cuda.empty_cache()
-            model.to(DEVICE)
+        model.to(DEVICE)
 
         gen_device = next(model.parameters()).device
         shape = (1, 128, height // 16, width // 16)
