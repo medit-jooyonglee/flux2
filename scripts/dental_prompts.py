@@ -1,9 +1,12 @@
-"""Random prompt generator for diverse face/teeth test images.
+"""Random prompt generator for diverse face/teeth images.
 
-Combines ethnicity/age/gender/expression/dental-condition keywords into prompts for
-klein 4B, so you get varied synthetic faces to stress-test dental imaging/detection
-pipelines. Each generated prompt comes with the attribute combination used to build
-it, so you can save it alongside the image as a label for later use.
+Combines ethnicity/age/gender/shot-angle/expression/dental-condition keywords into
+prompts for klein 4B, so you get varied synthetic faces -- not just frontal close-ups --
+to stress-test dental imaging/detection pipelines, or to seed the generic-face pool for
+the smile-design LoRA data pipeline (training/dataset/README.md's `bootstrap` step: run
+this first to build a diverse `--faces_dir`, then apply teeth-style edit instructions on
+top of those faces). Each generated prompt comes with the attribute combination used to
+build it, so you can save it alongside the image as a label for later use.
 
 Usage as a library:
   from dental_prompts import random_dental_prompt, random_dental_prompts
@@ -38,6 +41,23 @@ AGE_GROUPS = [
 
 GENDERS = ["male", "female"]
 
+# Shot framing + camera angle, combined into one natural phrase per entry (rather than
+# crossing two separate lists) so every combination still reads coherently in the prompt.
+SHOTS = [
+    "a frontal close-up portrait photo",
+    "a three-quarter angle close-up portrait photo, head turned slightly to the left",
+    "a three-quarter angle close-up portrait photo, head turned slightly to the right",
+    "a left profile portrait photo",
+    "a right profile portrait photo",
+    "a close-up portrait photo taken from slightly above eye level, looking down at the camera",
+    "a close-up portrait photo taken from slightly below eye level, looking up at the camera",
+    "an extreme close-up photo focused tightly on the mouth and teeth",
+    "a casual phone selfie photo, arm's-length framing, slight wide-angle lens distortion",
+    "a professional clinical dental photograph with cheek retractors, frontal intraoral view",
+    "a professional clinical dental photograph with cheek retractors, lateral intraoral view",
+    "a candid photo mid-conversation, head turned and mouth caught mid-motion",
+]
+
 EXPRESSIONS = [
     "smiling broadly showing teeth",
     "laughing with mouth wide open showing teeth",
@@ -62,7 +82,7 @@ DENTAL_CONDITIONS = [
 ]
 
 PROMPT_TEMPLATE = (
-    "a close-up portrait photo of a {age_group} {ethnicity} {gender}, "
+    "{shot} of a {age_group} {ethnicity} {gender}, "
     "{expression}, {dental_condition}, natural lighting, high detail, photorealistic"
 )
 
@@ -72,6 +92,7 @@ def random_dental_prompt(rng: random.Random | None = None) -> tuple[str, dict]:
     rng = rng or random
 
     attrs = {
+        "shot": rng.choice(SHOTS),
         "age_group": rng.choice(AGE_GROUPS),
         "ethnicity": rng.choice(ETHNICITIES),
         "gender": rng.choice(GENDERS),
