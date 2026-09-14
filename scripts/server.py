@@ -56,6 +56,29 @@ import bench_klein4b as bk  # noqa: E402
 
 app = Flask(__name__)
 
+# 브라우저(웹 클라이언트)에서 이 서버를 직접 호출할 수 있도록 CORS 허용.
+# Python `requests` 클라이언트는 same-origin 정책의 영향을 받지 않아 문제가 없었지만,
+# 브라우저 fetch는 이 헤더가 없으면 응답을 막고, 커스텀 X-* 헤더가 있는 POST는 preflight
+# (OPTIONS)부터 막힌다. flask-cors 의존성 없이 표준 Flask 훅만으로 처리한다.
+_CORS_ALLOWED_HEADERS = (
+    "Content-Type, X-Prompt, X-Width, X-Height, X-Num-Steps, X-Guidance, "
+    "X-Seed, X-Match-Image-Size, X-Cpu-Offloading, X-Image-Urls"
+)
+
+
+@app.after_request
+def _add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = _CORS_ALLOWED_HEADERS
+    response.headers["Access-Control-Expose-Headers"] = "X-Elapsed-Ms"
+    return response
+
+
+@app.route("/generate", methods=["OPTIONS"])
+def _generate_preflight():
+    return "", 204
+
 
 def _parse_bool(s: str | None, default: bool) -> bool:
     if s is None:
