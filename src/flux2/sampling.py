@@ -176,19 +176,22 @@ def center_crop_to_multiple_of_x(
     return resized
 
 
+def cap_size(width: int, height: int, max_pixels: int) -> tuple[int, int]:
+    """Scale (width, height) down to fit within max_pixels total, preserving aspect ratio."""
+    pixel_count = width * height
+    if pixel_count <= max_pixels:
+        return width, height
+    scale = math.sqrt(max_pixels / pixel_count)
+    return int(width * scale), int(height * scale)
+
+
 def cap_pixels(img: Image.Image | list[Image.Image], k):
     if isinstance(img, list):
         return [cap_pixels(_img, k) for _img in img]
     w, h = img.size
-    pixel_count = w * h
-
-    if pixel_count <= k:
+    new_w, new_h = cap_size(w, h, k)
+    if (new_w, new_h) == (w, h):
         return img
-
-    # Scaling factor to reduce total pixels below K
-    scale = math.sqrt(k / pixel_count)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
 
     return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 

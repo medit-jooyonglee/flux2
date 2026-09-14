@@ -31,12 +31,21 @@ import torch
 from einops import rearrange
 from PIL import Image
 
-from flux2.sampling import batched_prc_img, batched_prc_txt, denoise, encode_image_refs, get_schedule, scatter_ids
+from flux2.sampling import (
+    batched_prc_img,
+    batched_prc_txt,
+    cap_size,
+    denoise,
+    encode_image_refs,
+    get_schedule,
+    scatter_ids,
+)
 from flux2.util import FLUX2_MODEL_INFO, load_ae, load_flow_model, load_text_encoder
 
 MODEL_NAME = "flux.2-klein-4b"
 MODEL_INFO = FLUX2_MODEL_INFO[MODEL_NAME]
 DEVICE = torch.device("cuda")
+MAX_GEN_PIXELS = 1024 * 1024  # klein 4B's native training resolution budget
 
 _MODELS: dict[str, object] | None = None
 
@@ -116,7 +125,17 @@ def infer(
     guidance = guidance if guidance is not None else MODEL_INFO["defaults"]["guidance"]
 
     img_ctx = _load_images(input_images)
-    width, height = _resolve_size(width, height, img_ctx, match_image_size)
+    out_width, out_height = _resolve_size(width, height, img_ctx, match_image_size)
+
+    # Generate at a resolution capped to MAX_GEN_PIXELS (keeping aspect ratio) -- klein 4B
+    # is trained around 1024x1024, and denoise/decode cost scales with pixel count, so an
+    # oversized request (e.g. width/height taken from a UHD match_image_size reference)
+    # would otherwise be slow or OOM. The output is upscaled back to out_width/out_height
+    # (the originally requested/matched size) after decoding.
+    width, height = cap_size(out_width, out_height, MAX_GEN_PIXELS)
+    width, height = (width // 16) * 16, (height // 16) * 16
+    if (width, height) != (out_width, out_height):
+        print(f"  ! Capping generation to {width}x{height} (from {out_width}x{out_height}); will upscale back after")
 
     with torch.no_grad():
         # text_encoder is always on GPU on entry (every exit path below restores it there,
@@ -164,7 +183,10 @@ def infer(
             torch.cuda.empty_cache()
             text_encoder.to(DEVICE)
 
-    return _to_pil(out), elapsed
+    result_img = _to_pil(out)
+    if (width, height) != (out_width, out_height):
+        result_img = result_img.resize((out_width, out_height), Image.Resampling.LANCZOS)
+    return result_img, elapsed
 
 
 def main(

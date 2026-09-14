@@ -14,7 +14,12 @@ Endpoint: POST /generate
     X-Guidance           default: model default (1.0 for klein 4B)
     X-Seed               default 0
     X-Match-Image-Size   index into reference images to match output size to, optional
-    X-Cpu-Offloading     "true"/"false", default "true"
+    X-Cpu-Offloading     "true"/"false", default "false" -- keep models resident on GPU
+                          across requests (matches --preload's cpu_offloading=False).
+                          Set "true" only if you're VRAM-constrained: it saves memory by
+                          shuttling the 4B flow model between CPU/GPU every request, at
+                          the cost of a full-model PCIe round trip (several seconds) per
+                          call.
     X-Image-Urls         comma-separated URLs the server should download as reference
                           image(s) for editing/multi-reference generation, optional
 
@@ -121,7 +126,7 @@ def generate():
         seed = int(request.headers.get("X-Seed", 0))
         match_image_size = request.headers.get("X-Match-Image-Size")
         match_image_size = int(match_image_size) if match_image_size else None
-        cpu_offloading = _parse_bool(request.headers.get("X-Cpu-Offloading"), True)
+        cpu_offloading = _parse_bool(request.headers.get("X-Cpu-Offloading"), False)
         image_urls = request.headers.get("X-Image-Urls", "")
     except ValueError as e:
         return Response(f"Invalid header value: {e}", status=400)
