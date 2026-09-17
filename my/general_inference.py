@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""General text-to-image inference for Diffusers and original checkpoints.
+
+The default model is the local SD 1.5 checkpoint directory requested for this
+project.  ``--model`` may also point at a single .safetensors/.ckpt file, a
+Diffusers directory, or a Hugging Face repository ID.
+
+Random prompt syntax:
+  --prompt "a {red|blue|gold} sports car in __location__"
+
+Brace alternatives and wildcard files are expanded independently per image.
+For ``__location__``, one non-empty line is sampled from location.txt inside
+``--wildcards-dir``. Multiple --prompt/--prompt-file inputs form a random pool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import inspect
+import json
+import random
+import re
+import secrets
+import sys
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+DEFAULT_MODEL = Path("/data1/jooyonglee/pretrained/diffusions/sd15")
+BRACE_PATTERN = re.compile(r"\{([^{}]+)\}")
+WILDCARD_PATTERN = re.compile(r"__([A-Za-z0-9_.-]+)__")
+CHECKPOINT_SUFFIXES = {".safetensors", ".ckpt"}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate images from SD/SDXL checkpoints or Diffusers text-to-image models.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        default=str(DEFAULT_MODEL),
+        help="Checkpoint file, checkpoint-only directory, Diffusers directory, or Hugging Face model ID.",
+    )
+    parser.add_argument(
+        "--pipeline",
+        choices=("auto", "sd", "sdxl"),
+        default="auto",
+        help="Pipeline type. Auto detects SD vs SDXL for SafeTensor files and model_index.json for Diffusers models.",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional config directory/repo for from_single_file, useful for fully offline loading.",
+    )
+    parser.add_argument("--local-files-only", action="store_true", help="Forbid downloading missing model/config files.")
+
+    prompt_group = parser.add_argument_group("prompt input")
+    prompt_group.add_argument(
+        "--prompt",
+        action="append",
+        default=[],
+        help="Prompt template; repeat for a random prompt pool. Supports {a|b} and __wildcard__.",
+    )
+    prompt_group.add_argument(
+        "--prompt-file",
+        action="append",
+        default=[],
+        help="UTF-8 file with one prompt template per line; repeatable.",
+    )
+    prompt_group.add_argument(
+        "--negative-prompt",
+        action="append",
+        default=[],
+        help="Negative prompt template; repeat for a random pool. Empty by default.",
+    )
+    prompt_group.add_argument(
+        "--negative-prompt-file",
+        action="append",
+        default=[],
+        help="UTF-8 file with one negative prompt template per line; repeatable.",
+    )
+    prompt_group.add_argument(
+        "--wildcards-dir",
+        type=Path,
+        default=None,
+        help="Directory containing name.txt files referenced as __name__.",
+    )
+
+    generation = parser.add_argument_group("generation")
+    generation.add_argument("--num-images", type=positive_int, default=1, help="Total number of images to create.")
+    generation.add_argument("--batch-size", type=positive_int, default=1, help="Images generated in one pipeline call.")
+    generation.add_argument("--output-dir", type=Path, default=Path("outputs/general_inference"))
+    generation.add_argument("--filename-prefix", default="image")
+    generation.add_argument("--seed", type=int, default=None, help="Base seed. Omit for a random base seed.")
+    generation.add_argument("--width", type=multiple_of_8, default=None, help="Output width; model default if omitted.")
+    generation.add_argument("--height", type=multiple_of_8, default=None, help="Output height; model default if omitted.")
+    generation.add_argument("--steps", type=positive_int, default=30)
+    generation.add_argument("--guidance-scale", type=float, default=7.0)
+    generation.add_argument(
+        "--clip-skip",
+        type=positive_int,
+        default=2,
+        help=(
+            "AUTOMATIC1111/Civitai convention: 1 uses the final CLIP layer; 2 uses the penultimate layer. "
+            "Ignored by pipelines without CLIP-skip support."
+        ),
+    )
+    generation.add_argument(
+        "--scheduler",
+        choices=("model", "dpmpp-2m-karras", "euler-a", "euler", "ddim"),
+        default="dpmpp-2m-karras",
+    )
+
+    runtime = parser.add_argument_group("runtime")
+    runtime.add_argument("--device", default="cuda", help="Examples: cuda, cuda:1, cpu, mps.")
+    runtime.add_argument("--dtype", choices=("auto", "fp16", "bf16", "fp32"), default="auto")
+    runtime.add_argument("--cpu-offload", action="store_true", help="Use model CPU offload instead of pipe.to(device).")
+    runtime.add_argument("--xformers", action="store_true", help="Enable xFormers memory-efficient attention if installed.")
+    runtime.add_argument("--disable-safety-checker", action="store_true")
+    return parser.parse_args()
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def multiple_of_8(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed % 8:
+        raise argparse.ArgumentTypeError("must be divisible by 8")
+    return parsed
+
+
+def read_template_file(path: Path) -> list[str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def collect_templates(inline: list[str], files: list[str], *, allow_empty: bool) -> list[str]:
+    templates = [value.strip() for value in inline if value.strip()]
+    for file_name in files:
+        templates.extend(read_template_file(Path(file_name)))
+    if not templates and allow_empty:
+        return [""]
+    if not templates:
+        raise ValueError("At least one --prompt or --prompt-file entry is required.")
+    return templates
+
+
+class PromptExpander:
+    def __init__(self, rng: random.Random, wildcards_dir: Path | None) -> None:
+        self.rng = rng
+        self.wildcards_dir = wildcards_dir
+        self._wildcards: dict[str, list[str]] = {}
+
+    def _wildcard_values(self, name: str) -> list[str]:
+        if name in self._wildcards:
+            return self._wildcards[name]
+        if self.wildcards_dir is None:
+            raise ValueError(f"Prompt contains __{name}__, but --wildcards-dir was not provided.")
+        candidates = (self.wildcards_dir / f"{name}.txt", self.wildcards_dir / name)
+        path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if path is None:
+            raise FileNotFoundError(f"Wildcard file not found for __{name}__ in {self.wildcards_dir}")
+        values = read_template_file(path)
+        if not values:
+            raise ValueError(f"Wildcard file is empty: {path}")
+        self._wildcards[name] = values
+        return values
+
+    def expand(self, template: str) -> str:
+        text = template
+        while True:
+            match = BRACE_PATTERN.search(text)
+            if match is None:
+                break
+            options = [part.strip() for part in match.group(1).split("|") if part.strip()]
+            if not options:
+                raise ValueError(f"Empty random choice in prompt: {template!r}")
+            text = text[: match.start()] + self.rng.choice(options) + text[match.end() :]
+
+        def replace_wildcard(match: re.Match[str]) -> str:
+            return self.rng.choice(self._wildcard_values(match.group(1)))
+
+        return WILDCARD_PATTERN.sub(replace_wildcard, text)
+
+
+def resolve_model(value: str) -> tuple[str, bool]:
+    path = Path(value).expanduser()
+    if not path.exists():
+        return value, False  # Hugging Face repo ID
+    if path.is_file():
+        if path.suffix.lower() not in CHECKPOINT_SUFFIXES:
+            raise ValueError(f"Unsupported checkpoint extension: {path.suffix}")
+        return str(path.resolve()), True
+    if (path / "model_index.json").is_file():
+        return str(path.resolve()), False
+    checkpoints = sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() in CHECKPOINT_SUFFIXES)
+    if len(checkpoints) == 1:
+        return str(checkpoints[0].resolve()), True
+    if not checkpoints:
+        raise FileNotFoundError(f"No model_index.json or checkpoint file found in: {path}")
+    names = "\n  ".join(str(item) for item in checkpoints)
+    raise ValueError(f"Multiple checkpoints found; pass one file with --model:\n  {names}")
+
+
+def detect_single_file_pipeline(checkpoint: str) -> str:
+    if Path(checkpoint).suffix.lower() != ".safetensors":
+        return "sd"
+    from safetensors import safe_open
+
+    with safe_open(checkpoint, framework="pt", device="cpu") as handle:
+        keys = handle.keys()
+        is_sdxl = any(
+            "conditioner.embedders.1" in key or key.startswith("text_encoder_2.") or "add_embedding" in key
+            for key in keys
+        )
+    return "sdxl" if is_sdxl else "sd"
+
+
+def torch_dtype(name: str, device: str) -> Any:
+    import torch
+
+    if name == "auto":
+        return torch.float16 if device.startswith("cuda") else torch.float32
+    return {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[name]
+
+
+def load_pipeline(args: argparse.Namespace, model: str, single_file: bool) -> Any:
+    from diffusers import AutoPipelineForText2Image, StableDiffusionPipeline, StableDiffusionXLPipeline
+
+    dtype = torch_dtype(args.dtype, args.device)
+    kwargs: dict[str, Any] = {"torch_dtype": dtype, "local_files_only": args.local_files_only}
+    if args.disable_safety_checker:
+        kwargs.update(safety_checker=None, requires_safety_checker=False)
+
+    if single_file:
+        pipeline_type = detect_single_file_pipeline(model) if args.pipeline == "auto" else args.pipeline
+        pipeline_class = StableDiffusionXLPipeline if pipeline_type == "sdxl" else StableDiffusionPipeline
+        if args.config:
+            kwargs["config"] = args.config
+        print(f"Loading {pipeline_type.upper()} single-file checkpoint: {model}", flush=True)
+        pipe = pipeline_class.from_single_file(model, **kwargs)
+    else:
+        if args.pipeline == "sd":
+            pipeline_class = StableDiffusionPipeline
+        elif args.pipeline == "sdxl":
+            pipeline_class = StableDiffusionXLPipeline
+        else:
+            pipeline_class = AutoPipelineForText2Image
+        print(f"Loading Diffusers model with {pipeline_class.__name__}: {model}", flush=True)
+        pipe = pipeline_class.from_pretrained(model, **kwargs)
+
+    set_scheduler(pipe, args.scheduler)
+    if args.xformers:
+        pipe.enable_xformers_memory_efficient_attention()
+    if args.cpu_offload:
+        if not args.device.startswith("cuda"):
+            raise ValueError("--cpu-offload currently requires a CUDA device.")
+        gpu_id = int(args.device.split(":", 1)[1]) if ":" in args.device else 0
+        pipe.enable_model_cpu_offload(gpu_id=gpu_id)
+    else:
+        pipe.to(args.device)
+    pipe.set_progress_bar_config(dynamic_ncols=True)
+    return pipe
+
+
+def set_scheduler(pipe: Any, name: str) -> None:
+    if name == "model":
+        return
+    from diffusers import DDIMScheduler, DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler, EulerDiscreteScheduler
+
+    config = pipe.scheduler.config
+    if name == "dpmpp-2m-karras":
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+            config, algorithm_type="dpmsolver++", solver_order=2, use_karras_sigmas=True
+        )
+    elif name == "euler-a":
+        pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(config)
+    elif name == "euler":
+        pipe.scheduler = EulerDiscreteScheduler.from_config(config)
+    elif name == "ddim":
+        pipe.scheduler = DDIMScheduler.from_config(config)
+
+
+def supports_call_argument(pipe: Any, name: str) -> bool:
+    return name in inspect.signature(pipe.__call__).parameters
+
+
+def ensure_clip_skip_compatibility(pipe: Any) -> None:
+    """Bridge the flattened CLIPTextModel layout used by Transformers 5.x.
+
+    Some Diffusers CLIP-skip implementations access
+    ``text_encoder.text_model.final_layer_norm``. Transformers 5.x exposes
+    ``final_layer_norm`` directly instead. ``object.__setattr__`` deliberately
+    avoids registering a self-referential torch module.
+    """
+    text_encoder = getattr(pipe, "text_encoder", None)
+    if (
+        text_encoder is not None
+        and not hasattr(text_encoder, "text_model")
+        and hasattr(text_encoder, "final_layer_norm")
+    ):
+        object.__setattr__(
+            text_encoder,
+            "text_model",
+            SimpleNamespace(final_layer_norm=text_encoder.final_layer_norm),
+        )
+
+
+def save_image(image: Any, path: Path, metadata: dict[str, Any]) -> None:
+    from PIL.PngImagePlugin import PngInfo
+
+    png_info = PngInfo()
+    for key, value in metadata.items():
+        png_info.add_text(key, str(value))
+    image.save(path, pnginfo=png_info)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.batch_size > args.num_images:
+        args.batch_size = args.num_images
+
+    prompts = collect_templates(args.prompt, args.prompt_file, allow_empty=False)
+    negative_prompts = collect_templates(args.negative_prompt, args.negative_prompt_file, allow_empty=True)
+    model, single_file = resolve_model(args.model)
+
+    base_seed = args.seed if args.seed is not None else secrets.randbelow(2**63 - args.num_images)
+    prompt_rng = random.Random(base_seed)
+    expander = PromptExpander(prompt_rng, args.wildcards_dir)
+    expanded_prompts = [expander.expand(prompt_rng.choice(prompts)) for _ in range(args.num_images)]
+    expanded_negatives = [expander.expand(prompt_rng.choice(negative_prompts)) for _ in range(args.num_images)]
+    seeds = [base_seed + index for index in range(args.num_images)]
+
+    pipe = load_pipeline(args, model, single_file)
+    supports_clip_skip = supports_call_argument(pipe, "clip_skip")
+    # Diffusers clip_skip=1 selects the penultimate layer, while A1111/Civitai calls that CLIP skip 2.
+    diffusers_clip_skip = args.clip_skip - 1
+    if supports_clip_skip and diffusers_clip_skip > 0:
+        ensure_clip_skip_compatibility(pipe)
+    if args.clip_skip > 1 and not supports_clip_skip:
+        print(f"Warning: {type(pipe).__name__} does not expose clip_skip; ignoring --clip-skip.", file=sys.stderr)
+
+    import torch
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    records: list[dict[str, Any]] = []
+
+    for start in range(0, args.num_images, args.batch_size):
+        stop = min(start + args.batch_size, args.num_images)
+        batch_prompts = expanded_prompts[start:stop]
+        batch_negatives = expanded_negatives[start:stop]
+        batch_seeds = seeds[start:stop]
+        generators = [torch.Generator(device=args.device).manual_seed(seed) for seed in batch_seeds]
+
+        call_kwargs: dict[str, Any] = {
+            "prompt": batch_prompts,
+            "negative_prompt": batch_negatives,
+            "num_inference_steps": args.steps,
+            "guidance_scale": args.guidance_scale,
+            "num_images_per_prompt": 1,
+            "generator": generators,
+        }
+        if args.width is not None:
+            call_kwargs["width"] = args.width
+        if args.height is not None:
+            call_kwargs["height"] = args.height
+        if supports_clip_skip and diffusers_clip_skip > 0:
+            call_kwargs["clip_skip"] = diffusers_clip_skip
+
+        print(f"Generating {start + 1}-{stop}/{args.num_images}...", flush=True)
+        with torch.inference_mode():
+            images = pipe(**call_kwargs).images
+
+        for offset, image in enumerate(images):
+            index = start + offset
+            seed = batch_seeds[offset]
+            filename = f"{args.filename_prefix}_{run_id}_{index + 1:04d}_seed{seed}.png"
+            output_path = args.output_dir / filename
+            metadata = {
+                "prompt": batch_prompts[offset],
+                "negative_prompt": batch_negatives[offset],
+                "seed": seed,
+                "model": model,
+                "pipeline": type(pipe).__name__,
+                "scheduler": type(pipe.scheduler).__name__,
+                "steps": args.steps,
+                "guidance_scale": args.guidance_scale,
+                "clip_skip_ui": args.clip_skip if supports_clip_skip else "unsupported",
+                "width": image.width,
+                "height": image.height,
+            }
+            save_image(image, output_path, metadata)
+            records.append({"file": str(output_path), **metadata})
+            print(f"Saved: {output_path}", flush=True)
+
+    manifest = {
+        "model": model,
+        "base_seed": base_seed,
+        "num_images": args.num_images,
+        "arguments": vars(args) | {"output_dir": str(args.output_dir), "wildcards_dir": str(args.wildcards_dir) if args.wildcards_dir else None},
+        "images": records,
+    }
+    manifest_path = args.output_dir / f"manifest_{run_id}.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Manifest: {manifest_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (FileNotFoundError, ValueError) as error:
+        raise SystemExit(f"Error: {error}") from error

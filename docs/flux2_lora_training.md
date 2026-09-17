@@ -1,5 +1,11 @@
 # LoRA Training for FLUX.2
 
+> **A concrete, runnable setup based on the recommendation below now lives in
+> [`../training/`](../training/README.md)** (isolated venv, official diffusers
+> klein img2img LoRA script, dataset builder, and an eval script). Read that first if
+> you actually want to run training; this doc remains as the background/rationale for
+> why that's structured the way it is.
+
 This repository is an **inference-only** codebase. There is no training loop, optimizer, loss computation, dataset abstraction, or LoRA/PEFT integration anywhere in `src/flux2` or `scripts/` — only forward-pass sampling and checkpoint loading. This doc summarizes what exists today, why LoRA can't be trained directly against this codebase, and which external, verified training stacks to use instead.
 
 ## Current state of this repo

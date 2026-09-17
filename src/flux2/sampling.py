@@ -52,15 +52,14 @@ def scatter_ids(x: Tensor, x_ids: Tensor) -> list[Tensor]:
 def encode_image_refs(ae, img_ctx: list[Image.Image]):
     scale = 10
 
-    if len(img_ctx) > 1:
-        limit_pixels = 1024**2
-    elif len(img_ctx) == 1:
-        limit_pixels = 2024**2
-    else:
-        limit_pixels = None
-
     if not img_ctx:
         return None, None
+
+    # Cap every reference image to klein 4B's ~1024x1024 training budget before it hits
+    # the (memory-hungry) AE encode -- an FHD/UHD upload here otherwise blows up VRAM
+    # regardless of the requested output size, since this runs independently of
+    # infer()'s own MAX_GEN_PIXELS cap on the generation shape.
+    limit_pixels = 1024**2
 
     img_ctx_prep = default_prep(img=img_ctx, limit_pixels=limit_pixels)
     if not isinstance(img_ctx_prep, list):

@@ -30,6 +30,24 @@ NSFW_THRESHOLD = 0.85
 UPSAMPLING_MAX_IMAGE_SIZE = 768**2
 
 
+def _resolve_device_map(device: str | torch.device) -> str:
+    """`transformers.from_pretrained(..., device_map=...)` does NOT behave like a plain
+    `.to(device)`/`torch.device(...)` call: a bare "cuda" (no index) always dispatches to
+    physical GPU 0, ignoring `torch.cuda.set_device()`/`torch.cuda.current_device()` --
+    confirmed directly (a `device_map="cuda"` load landed on cuda:0 even right after
+    `torch.cuda.set_device('cuda:5')`). Every other model in this file/repo is placed via
+    plain `.to(device)`, which *does* respect the current device, so on any box where the
+    process's current device isn't 0 (e.g. scripts/server.py's `torch.cuda.set_device`),
+    an unresolved "cuda" here silently splits the text encoder onto a different GPU than
+    everything else -> "Expected all tensors to be on the same device" at inference time.
+    Resolving to an explicit index here keeps it consistent with the rest of the pipeline.
+    """
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        return f"cuda:{torch.cuda.current_device()}"
+    return str(resolved)
+
+
 def _fp8_supported(device: str | torch.device) -> bool:
     """FP8 checkpoints load via Triton kernels that lower the e4m3 dtype to native
     hardware ops, which Triton only supports on Ada/Hopper (compute capability >= 8.9).
@@ -386,7 +404,7 @@ class Qwen3Embedder(nn.Module):
         self.model = AutoModelForCausalLM.from_pretrained(
             model_spec,
             torch_dtype=None,
-            device_map=str(device),
+            device_map=_resolve_device_map(device),
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_spec)
