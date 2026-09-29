@@ -60,9 +60,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _output_path(base: Path, index: int, total: int) -> Path:
-    if total == 1:
-        return base
     suffix = base.suffix or ".png"
+    if total == 1:
+        return base if base.suffix else base.with_suffix(suffix)
     return base.with_name(f"{base.stem}_{index:03d}{suffix}")
 
 
@@ -71,8 +71,10 @@ def main() -> None:
 
     try:
         import torch
-        from diffusers import Flux2KleinPipeline
+        from diffusers import Flux2KleinPipeline, Flux2Transformer2DModel
+        from huggingface_hub import hf_hub_download, snapshot_download
         from PIL import Image
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
             "Missing LoRA inference dependencies. Build the environment described in training/README.md first."
@@ -86,8 +88,45 @@ def main() -> None:
         "fp16": torch.float16,
         "fp32": torch.float32,
     }
-    print(f"Loading model: {args.model}", flush=True)
-    pipe = Flux2KleinPipeline.from_pretrained(args.model, torch_dtype=dtypes[args.dtype])
+    dtype = dtypes[args.dtype]
+    print(f"Loading cached server model: {args.model}", flush=True)
+    transformer_file = hf_hub_download(
+        repo_id=args.model,
+        filename="flux-2-klein-4b.safetensors",
+        local_files_only=True,
+    )
+    model_snapshot = str(Path(transformer_file).parent)
+
+    transformer = Flux2Transformer2DModel.from_single_file(
+        transformer_file,
+        config=model_snapshot,
+        subfolder="transformer",
+        dtype=dtype,
+        local_files_only=True,
+    )
+
+    qwen_snapshot = snapshot_download(
+        repo_id="Qwen/Qwen3-4B-FP8",
+        local_files_only=True,
+    )
+    text_encoder = AutoModelForCausalLM.from_pretrained(
+        qwen_snapshot,
+        dtype="auto",
+        local_files_only=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        qwen_snapshot,
+        local_files_only=True,
+    )
+
+    pipe = Flux2KleinPipeline.from_pretrained(
+        model_snapshot,
+        transformer=transformer,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        dtype=dtype,
+        local_files_only=True,
+    )
 
     load_kwargs = {"adapter_name": args.adapter_name}
     if args.weight_name:
@@ -122,12 +161,18 @@ def main() -> None:
         pipe.to(args.device)
         generator_device = args.device
 
+    prompt_embeds, _ = pipe.encode_prompt(
+        prompt=args.prompt,
+        device=pipe._execution_device,
+        num_images_per_prompt=1,
+    )
+    prompt_embeds = prompt_embeds.to(device=pipe._execution_device, dtype=pipe.transformer.dtype)
+
     call_kwargs = {
-        "prompt": args.prompt,
+        "prompt_embeds": prompt_embeds,
         "num_inference_steps": args.steps,
         "guidance_scale": args.guidance_scale,
-        "num_images_per_prompt": args.num_images,
-        "generator": torch.Generator(device=generator_device).manual_seed(args.seed),
+        "num_images_per_prompt": 1,
     }
     if args.height is not None:
         call_kwargs.update(height=args.height, width=args.width)
@@ -137,14 +182,15 @@ def main() -> None:
             raise FileNotFoundError(f"Input image not found: {input_path}")
         call_kwargs["image"] = Image.open(input_path).convert("RGB")
 
-    with torch.inference_mode():
-        images = pipe(**call_kwargs).images
-
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    for index, image in enumerate(images):
-        output_path = _output_path(args.output, index, len(images))
-        image.save(output_path)
-        print(f"Saved: {output_path}", flush=True)
+    with torch.inference_mode():
+        for index in range(args.num_images):
+            seed = args.seed + index
+            call_kwargs["generator"] = torch.Generator(device=generator_device).manual_seed(seed)
+            image = pipe(**call_kwargs).images[0]
+            output_path = _output_path(args.output, index, args.num_images)
+            image.save(output_path)
+            print(f"Saved: {output_path} (seed={seed})", flush=True)
 
 
 if __name__ == "__main__":

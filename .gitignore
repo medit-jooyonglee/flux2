@@ -230,3 +230,13 @@ $RECYCLE.BIN/
 # End of https://www.toptal.com/developers/gitignore/api/linux,windows,macos,visualstudiocode,python
 
 output/
+
+# LoRA training: vendored upstream scripts (re-fetched per training/README.md) and any
+# face/dental photos or generated results -- never commit these.
+training/external/
+training/dataset/smile_design/images/
+training/dataset/smile_design/metadata.jsonl
+training/dataset/staging/
+training/eval/results/
+*.png
+*.json

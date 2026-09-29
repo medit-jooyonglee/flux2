@@ -210,13 +210,15 @@ def generate():
 
 if __name__ == "__main__":
     import torch
-    torch.cuda.set_device('cuda:5')
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8602)
     parser.add_argument("--preload", action="store_true", default=True)
     parser.add_argument("--no-preload", dest="preload", action="store_false")
+    parser.add_argument("--device", default="cuda:5")
     args = parser.parse_args()
+    torch.cuda.set_device(args.device)
 
     if args.preload:
         # Load models at startup rather than on the first request.

@@ -329,6 +329,9 @@ def main() -> None:
         args.batch_size = args.num_images
 
     prompts = collect_templates(args.prompt, args.prompt_file, allow_empty=False)
+    if args.num_images < 0:
+        args.num_images = len(prompts)
+        print(f"Number of images set to the number of prompts: {args.num_images}")
     negative_prompts = collect_templates(args.negative_prompt, args.negative_prompt_file, allow_empty=True)
     model, single_file = resolve_model(args.model)
 

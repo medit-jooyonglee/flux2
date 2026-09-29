@@ -694,6 +694,7 @@ INT4
 
 최종 배포 모델 크기와 VRAM을 낮춘다.
 
+## tensorboard를 이용해 epoch 마다 이미지 저장해서 평가
 ## 21. 평가 지표
 
 ### Image Quality
